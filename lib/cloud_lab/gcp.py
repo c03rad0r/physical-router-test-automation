@@ -627,6 +627,7 @@ def submit_run(
     vwifi: bool = False,
     wifi_plane: str = "tap",
     lease_minutes: int = 60,
+    benchmark: bool = False,
 ) -> dict[str, str]:
     """Pre-flight artifact check, then create fire-and-forget GCP VM. Returns run metadata."""
     cleanup_stale(max_age_hours=2)
@@ -681,6 +682,7 @@ def submit_run(
         "tollgate-vwifi": "true" if vwifi else "false",
         "tollgate-wifi-plane": wifi_plane,
         "tollgate-lease-minutes": str(lease_minutes),
+        "tollgate-benchmark": "true" if benchmark else "false",
         "tollgate-delete-at": str(int(time.time()) + lease_minutes * 60),
     }
     metadata_payload = ",".join(f"{k}={v}" for k, v in metadata.items())

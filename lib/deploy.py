@@ -506,14 +506,15 @@ def _download_blossom_binary(url: str, build_dir: Path) -> Path | None:
 
 def download_artifact(branch: str, arch: str, run_id: str | None = None,
                       repo: str | None = None, workflow: str | None = None,
-                      output_name: str | None = None) -> Path:
+                      output_name: str | None = None,
+                      commit: str | None = None) -> Path:
     artifact_repo = repo or REPO
     artifact_workflow = workflow or WORKFLOW
     if BUILD_DIR.exists():
         shutil.rmtree(BUILD_DIR)
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
-    target_commit = os.environ.get("TOLLGATE_SUT_COMMIT", "")
+    target_commit = commit or os.environ.get("TOLLGATE_SUT_COMMIT", "")
     blossom_binary = _resolve_blossom_binary(target_commit or None, arch)
     if blossom_binary:
         log.info("Found Blossom binary: %s", blossom_binary.get("filename", "?"))
@@ -926,7 +927,7 @@ def deploy_portal(router, portal, arch: str | None = None, branch: str = "main")
 def deploy_branch(router, branch: str, arch: str | None = None,
                   run_id: str | None = None, force: bool = False,
                   reboot: bool = False, repo: str | None = None,
-                  backend=None) -> dict[str, object]:
+                  backend=None, commit: str | None = None) -> dict[str, object]:
     if not arch:
         env_arch = os.environ.get("TOLLGATE_ROUTER_ARCH")
         if env_arch:
@@ -949,5 +950,6 @@ def deploy_branch(router, branch: str, arch: str | None = None,
     artifact_repo = repo or (backend.repo if backend else None)
     artifact_workflow = backend.workflow if backend else None
     ipk_path = download_artifact(branch, arch, run_id=run_id,
-                                 repo=artifact_repo, workflow=artifact_workflow)
+                                 repo=artifact_repo, workflow=artifact_workflow,
+                                 commit=commit)
     return deploy(router, ipk_path, reboot=reboot, backend=backend)

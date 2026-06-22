@@ -34,9 +34,7 @@ from typing import Any
 
 # --- Constants ---
 
-DEFAULT_RELAYS = [
-    "wss://relay.cashu.email",
-]
+from lib.constants import NOSTR_RELAYS as DEFAULT_RELAYS
 
 KIND_NIP94_FILE_METADATA = 1063   # NIP-94: file header for BlossomFS
 KIND_APP_DATA = 30078             # Parameterized replaceable: run index
@@ -248,8 +246,11 @@ def publish_test_run_event(
     file_urls: list = None,
     summary: str = "",
     relays: list = None,
+    extra_tags: list = None,
 ) -> dict:
     """Publish a kind 30078 parameterized replaceable test-run index event.
+
+    Deprecated: kind 30078 will be replaced by kind 6900 (DVM) in future.
 
     This is the "index" event that reader pages fetch to discover all
     artifacts belonging to a test run. The d-tag is set to run_id, making it
@@ -279,6 +280,9 @@ def publish_test_run_event(
         ["t", "test-run"],
         ["timestamp", str(timestamp)],
     ]
+
+    if extra_tags:
+        tags.extend(extra_tags)
 
     # Each file URL as a separate tag so consumers can enumerate them
     for url in file_urls:

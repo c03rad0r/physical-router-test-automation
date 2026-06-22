@@ -45,6 +45,7 @@ for host in hosts:
         repo={repo_arg},
         backend=backend,
         run_id={run_id_arg},
+        commit={repr(config.sut_commit)} if config.sut_commit else None,
     )
     print(
         f"host={{host}} version={{result['installed_version']}} "

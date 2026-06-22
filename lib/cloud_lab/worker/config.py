@@ -40,6 +40,7 @@ class WorkerConfig:
     complete: bool
     wifi_plane: str
     lease_minutes: int = 60
+    benchmark: bool = False  # Run optional post-test benchmarks
     runner_mode: bool = False  # True when running inside GitHub Actions self-hosted runner
 def _metadata_get(key: str) -> str:
     req = urllib.request.Request(
@@ -83,6 +84,7 @@ def load_config_from_metadata() -> WorkerConfig:
         complete=_metadata_get_optional("tollgate-complete").lower() in ("true", "1", "yes"),
         wifi_plane=_metadata_get_optional("tollgate-wifi-plane", "tap"),
         lease_minutes=int(_metadata_get_optional("tollgate-lease-minutes", "60")),
+        benchmark=_metadata_get_optional("tollgate-benchmark").lower() in ("true", "1", "yes"),
     )
     log.info(
         "Config: run=%s branch=%s repo=%s backend=%s pr=%s publish=%s keep_on_fail=%s mint=%s portal=%s hwsim=%s vwifi=%s quick=%s smoke=%s complete=%s wifi_plane=%s",

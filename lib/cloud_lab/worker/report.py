@@ -14,6 +14,7 @@ from lib.cloud_lab.constants import CLOUD_ARCH, OPENWRT_IP, TEST_DIR
 from lib.cloud_lab.worker.config import WorkerConfig
 from lib.cloud_lab.worker.runner import pytest_collect_args, runner_scope
 from lib.cloud_lab.worker.shell import _redact, _run, log
+from lib.constants import BLOSSOM_SERVERS, NOSTR_RELAYS
 
 def collect_and_render(config: WorkerConfig, results_dir: str, started_at: str, finished_at: str) -> None:
     commit_arg = f"--sut-commit {config.sut_commit} " if config.sut_commit else ""
@@ -131,11 +132,16 @@ def publish_results(config: WorkerConfig, results_dir: str) -> str:
         raise
 
     return expected_url
-def publish_to_nostr(config: WorkerConfig, results_dir: str, counts: dict[str, Any]) -> str:
+def publish_to_nostr(config: WorkerConfig, results_dir: str, counts: dict[str, Any]) -> dict[str, Any]:
     """Publish test results to Blossom + Nostr (kind 30078).
+
+    Deprecated: kind 30078 will be replaced by kind 6900 (DVM) in future.
 
     Requires nak CLI and an nsec file on the VM. Falls back silently if
     either is missing (non-fatal).
+
+    Returns the manifest dict from result_publisher (containing ``files``
+    with Blossom URLs), or an empty dict on failure.
     """
     import shutil
 
@@ -147,14 +153,14 @@ def publish_to_nostr(config: WorkerConfig, results_dir: str, counts: dict[str, A
                 break
     if not nsec_file or not Path(nsec_file).exists():
         log.warning("Nostr publish skipped: nsec file not found")
-        return ""
+        return {}
 
     if not shutil.which("nak"):
         log.warning("Nostr publish skipped: nak CLI not installed")
-        return ""
+        return {}
 
-    blossom = os.environ.get("BLOSSOM_SERVER", "https://blossom.psbt.me")
-    relays = os.environ.get("NOSTR_RELAYS", "wss://relay.cashu.email")
+    blossom = BLOSSOM_SERVERS[0] if BLOSSOM_SERVERS else "https://blossom.psbt.me"
+    relays = ",".join(NOSTR_RELAYS) if NOSTR_RELAYS else "wss://relay.cashu.email"
 
     passed = counts.get("passed", 0)
     failed = counts.get("failed", 0)
@@ -173,9 +179,12 @@ def publish_to_nostr(config: WorkerConfig, results_dir: str, counts: dict[str, A
         f"--commit {shlex.quote((config.sut_commit or 'unknown')[:7])} "
         f"--portal {shlex.quote(config.portal or 'builtin')} "
         f"--lab-type gcloud "
+        f"--sut-backend {shlex.quote(config.backend)} "
+        f"--sut-repo {shlex.quote(config.artifact_repo)} "
         f"-v"
     )
 
+    manifest: dict[str, Any] = {}
     try:
         log.info("Publishing to Blossom (%s) + Nostr (%s)...", blossom, relays)
         r = _run(cmd, timeout=600, check=False)
@@ -184,15 +193,30 @@ def publish_to_nostr(config: WorkerConfig, results_dir: str, counts: dict[str, A
             for line in stdout.splitlines()[-5:]:
                 log.info("nostr-publish: %s", line)
             log.info("Nostr publish complete")
+            manifest = _parse_manifest_from_stdout(stdout)
         else:
             log.error("Nostr publish failed (rc=%d): %s", r.returncode, stdout[-300:])
     except Exception as exc:
         log.error("Nostr publish error (non-fatal): %s", _redact(str(exc))[:500])
-    return ""
+    return manifest
+
+
+def _parse_manifest_from_stdout(stdout: str) -> dict[str, Any]:
+    """Extract the last JSON object from result_publisher stdout."""
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {}
 
 
 def verify_nostr_publish(config: WorkerConfig) -> dict[str, Any]:
     """Verify that the kind 30078 event and Blossom blobs are retrievable.
+
+    Deprecated: kind 30078 will be replaced by kind 6900 (DVM) in future.
 
     Called after :func:`publish_to_nostr`. Uses ``nak req`` to query the
     relay for the kind 30078 event with ``d`` = ``config.run_id``, then
@@ -215,7 +239,7 @@ def verify_nostr_publish(config: WorkerConfig) -> dict[str, Any]:
         log.warning("verify_nostr_publish skipped: nak CLI not found")
         return result
 
-    relays_env = os.environ.get("NOSTR_RELAYS", "wss://relay.cashu.email")
+    relays_env = ",".join(NOSTR_RELAYS) if NOSTR_RELAYS else "wss://relay.cashu.email"
     relay = relays_env.split(",")[0].strip()
 
     # Allow a brief window for relay propagation

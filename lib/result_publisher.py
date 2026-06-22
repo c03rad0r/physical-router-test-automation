@@ -1,5 +1,7 @@
 """Result publishing orchestrator for physical-router-test-automation.
 
+Deprecated: kind 30078 will be replaced by kind 6900 (DVM) in future.
+
 Ties together three peer modules into one flow:
 
     scan results dir  ->  upload each file to Blossom  ->
@@ -56,6 +58,7 @@ from pathlib import Path
 # Peer modules (siblings). Relative imports require running as a module:
 #   python -m lib.result_publisher
 from .blossom_publisher import compute_sha256, get_blob_url, upload_to_blossom
+from .constants import BLOSSOM_SERVERS, NOSTR_RELAYS
 from .nostr_publisher import publish_nip94_event, publish_test_run_event
 from .secret_scanner import is_blocked_file, scan_directory, scan_file
 
@@ -68,18 +71,10 @@ from .secret_scanner import is_blocked_file, scan_directory, scan_file
 DEFAULT_MAX_FILE_SIZE = 10_000_000
 
 #: Default Blossom server if neither CLI nor env provides one.
-DEFAULT_BLOSSOM_SERVER = os.environ.get(
-    "BLOSSOM_SERVER", "https://blossom.psbt.me"
-)
+DEFAULT_BLOSSOM_SERVER = BLOSSOM_SERVERS[0] if BLOSSOM_SERVERS else "https://blossom.psbt.me"
 
 #: Default relays if neither CLI nor env provides them.
-DEFAULT_RELAYS = [
-    r.strip()
-    for r in os.environ.get(
-        "NOSTR_RELAYS", "wss://relay.cashu.email"
-    ).split(",")
-    if r.strip()
-]
+DEFAULT_RELAYS = list(NOSTR_RELAYS)
 
 #: Defense-in-depth: files never uploaded even if the scanner marks them clean.
 #: Adds coverage (sqlite/db/log) the scanner's own suffix list lacks.
@@ -472,6 +467,12 @@ def publish_results(
     }
     summary_content = json.dumps(summary_payload, separators=(",", ":"))
 
+    extra_tags: list = []
+    if metadata.get("backend"):
+        extra_tags.append(["backend", metadata["backend"]])
+    if metadata.get("sut_repo"):
+        extra_tags.append(["sut_repo", metadata["sut_repo"]])
+
     summary_event_id: str | None = None
     try:
         result = publish_test_run_event(
@@ -481,6 +482,7 @@ def publish_results(
             file_urls=file_urls,
             summary=summary_content,
             relays=relays,
+            extra_tags=extra_tags if extra_tags else None,
         )
         if result.get("success"):
             summary_event_id = result.get("event_id") or None
@@ -605,6 +607,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Portal/addon name (e.g., net4sats, builtin)",
     )
     p.add_argument(
+        "--sut-backend", default=None,
+        help="Backend type metadata (go or rust) — added as Nostr tag for filtering",
+    )
+    p.add_argument(
+        "--sut-repo", default=None,
+        help="SUT repository (e.g., Amperstrand/tollgate-rs-ai-research-and-experiments) — added as Nostr tag",
+    )
+    p.add_argument(
         "--max-file-size", type=int, default=DEFAULT_MAX_FILE_SIZE,
         help=f"Skip files larger than this many bytes (default: {DEFAULT_MAX_FILE_SIZE})",
     )
@@ -660,6 +670,10 @@ def main(argv: list[str] | None = None) -> int:
         metadata["commit"] = args.commit
     if args.portal:
         metadata["portal"] = args.portal
+    if args.sut_backend:
+        metadata["backend"] = args.sut_backend
+    if args.sut_repo:
+        metadata["sut_repo"] = args.sut_repo
 
     start = time.monotonic()
     try:

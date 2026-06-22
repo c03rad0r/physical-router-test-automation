@@ -415,14 +415,28 @@ def run_worker(config: WorkerConfig) -> int:
         if config.publish and run_json.exists():
             try:
                 log.info("Publishing results to Blossom + Nostr (total_tests=%d)...", total_run)
-                publish_to_nostr(config, results_dir, counts)
+                manifest = publish_to_nostr(config, results_dir, counts)
                 verify_nostr_publish(config)
-                dvm_job_result(config, counts)
+                result_urls = [f["url"] for f in manifest.get("files", [])] if manifest else []
+                dvm_job_result(config, counts, result_urls)
                 report_url = "https://tests.tollgate.me/"
                 if config.gh_token:
                     post_pr_comment(config, report_url, counts)
             except Exception as pub_exc:
                 log.error("Publish failed (non-fatal): %s", _redact(str(pub_exc))[:500])
+
+        # ── Optional post-test benchmarks (never blocks test reports) ─────
+        if config.benchmark:
+            _step_start("benchmarks")
+            try:
+                log.info("[bonus] Running post-test benchmarks...")
+                from lib.cloud_lab.worker.benchmark import run_benchmarks, publish_benchmark_to_nostr
+                bench_results = run_benchmarks(config)
+                if config.publish:
+                    publish_benchmark_to_nostr(config, bench_results)
+            except Exception as bench_exc:
+                log.error("Benchmarks failed (non-fatal): %s", _redact(str(bench_exc))[:500])
+            _step_end("benchmarks")
 
         dvm_feedback("success" if test_exit == 0 else "error", f"exit={test_exit}")
 

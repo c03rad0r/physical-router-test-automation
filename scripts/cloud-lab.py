@@ -177,6 +177,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
         vwifi=cast(bool, getattr(args, "vwifi", False)),
         wifi_plane=cast(str, getattr(args, "wifi_plane", "tap")),
         lease_minutes=cast(int, getattr(args, "lease", 60)),
+        benchmark=cast(bool, getattr(args, "benchmark", False)),
     )
     pr_line = f"  PR:           {target.pr} ({target.repo}@{target.branch})\n" if target.pr else f"  Branch:       {target.repo}@{target.branch}\n"
     mint_line = f"  Mint:         {cast(str, args.mint)}\n" if cast(str, args.mint) != "auto" else ""
@@ -392,6 +393,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force a specific mint type instead of auto-detection. Use 'submit-all-mints' for parallel runs.")
     submit.add_argument("--portal", default="builtin", choices=["builtin", "net4sats"],
         help="Captive portal to deploy (default: builtin). 'net4sats' deploys the configurationwizzard SPA.")
+    submit.add_argument("--benchmark", action="store_true",
+        help="Run optional post-test benchmarks (HTTP latency, throughput, system metrics). "
+             "Publishes results separately via Nostr — never blocks test reports.")
     target_flags(submit)
     submit.set_defaults(func=cmd_submit)
 
