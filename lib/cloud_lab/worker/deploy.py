@@ -15,6 +15,7 @@ def deploy_tollgate(config: WorkerConfig) -> None:
     branch_arg = repr(config.sut_branch)
     run_id_arg = repr(config.artifact_run_id)
     backend_arg = repr(config.backend)
+    commit_arg = repr(config.sut_commit) if config.sut_commit else 'None'
     py = f"""
 import logging
 import os
@@ -45,7 +46,7 @@ for host in hosts:
         repo={repo_arg},
         backend=backend,
         run_id={run_id_arg},
-        commit={repr(config.sut_commit)} if config.sut_commit else None,
+        commit={commit_arg},
     )
     print(
         f"host={{host}} version={{result['installed_version']}} "
