@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Bake a new GCP snapshot with all cloud lab dependencies pre-installed.
+"""Bake a snapshot with all cloud lab dependencies pre-installed.
 
-Creates a temporary VM from the current snapshot, installs gh CLI, Python venv,
-cashu venv, and pre-provisions the OpenWrt base image. Then snapshots the disk
-and cleans up.
+Supports GCP and SHC (Sovereign Hybrid Compute). Creates a temporary VM,
+installs gh CLI, Python venv, cashu venv, and pre-provisions the OpenWrt
+base image. Then snapshots the disk and cleans up.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import cast
 
@@ -40,53 +45,254 @@ from lib.cloud_lab.gcp import (
 )
 
 
-def _run_gcloud(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
-    markers = (
-        "NameResolutionError", "Failed to resolve", "ConnectionError",
-        "Max retries exceeded", "Network is unreachable", "timed out",
-    )
-    last = subprocess.CompletedProcess(args=["gcloud"], returncode=1, stdout="", stderr="")
-    for attempt in range(1, 4):
-        last = subprocess.run(
-            ["gcloud", *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+# ── Provider Abstraction ─────────────────────────────────────────
+
+class CloudProvider(ABC):
+    """Abstract VM lifecycle + SSH for bake operations."""
+    name: str
+
+    @abstractmethod
+    def create_vm(self, name: str, machine_type: str, disk_size_gb: int) -> dict:
+        """Create a VM. Returns dict with at least {'ip': str, 'id': str}."""
+        ...
+
+    @abstractmethod
+    def ssh(self, ip: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        """Run a command on the VM via SSH."""
+        ...
+
+    @abstractmethod
+    def wait_ssh(self, ip: str, timeout: int = 180) -> bool:
+        """Wait until SSH is available."""
+        ...
+
+    @abstractmethod
+    def create_snapshot(self, vm_id: str, name: str) -> bool:
+        """Take a snapshot of the VM. Returns True on success."""
+        ...
+
+    @abstractmethod
+    def delete_vm(self, vm_id: str) -> None:
+        """Delete the VM."""
+        ...
+
+    @abstractmethod
+    def get_ssh_user(self) -> str:
+        """Return the SSH username for this provider."""
+        ...
+
+
+class GCPProvider(CloudProvider):
+    """GCP VM lifecycle via gcloud CLI."""
+
+    name = "gcp"
+
+    def __init__(self, zone: str, project: str, base_snapshot: str = ""):
+        self.zone = zone
+        self.project = project
+        self.base_snapshot = base_snapshot
+
+    def _run_gcloud(self, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        markers = (
+            "NameResolutionError", "Failed to resolve", "ConnectionError",
+            "Max retries exceeded", "Network is unreachable", "timed out",
         )
-        combined = f"{last.stderr}\n{last.stdout}"
-        if last.returncode == 0 or not any(m in combined for m in markers):
-            return last
-        if attempt < 3:
-            print(f"WARNING: transient gcloud failure, retrying ({attempt}/3): {last.stderr[:200]}", file=sys.stderr)
-            time.sleep(5 * attempt)
-    return last
+        last = subprocess.CompletedProcess(args=["gcloud"], returncode=1, stdout="", stderr="")
+        for attempt in range(1, 4):
+            last = subprocess.run(
+                ["gcloud", *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            combined = f"{last.stderr}\n{last.stdout}"
+            if last.returncode == 0 or not any(m in combined for m in markers):
+                return last
+            if attempt < 3:
+                print(f"WARNING: transient gcloud failure, retrying ({attempt}/3): {last.stderr[:200]}", file=sys.stderr)
+                time.sleep(5 * attempt)
+        return last
+
+    def create_vm(self, name: str, machine_type: str, disk_size_gb: int) -> dict:
+        ensure_firewall_rules(self.project)
+        r = self._run_gcloud([
+            "compute", "instances", "create", name,
+            f"--project={self.project}", f"--zone={self.zone}",
+            f"--machine-type={machine_type}",
+            f"--source-snapshot={self.base_snapshot}",
+            f"--boot-disk-size={disk_size_gb}GB",
+            "--enable-nested-virtualization",
+            "--min-cpu-platform=Intel Cascade Lake",
+            "--tags=tollgate-runner",
+        ], timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"Failed to create GCP VM: {r.stderr}")
+        # GCP uses VM name as connection target (gcloud resolves IP internally)
+        return {"ip": name, "id": name}
+
+    def ssh(self, ip: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        vm_name = ip  # For GCP, ip is actually the VM name
+        wrapped = f"sudo HOME=/root bash -c {shlex.quote(command)}"
+        cmd = [
+            "gcloud", "compute", "ssh", vm_name,
+            f"--project={self.project}", f"--zone={self.zone}",
+            "--command", wrapped,
+            "--ssh-flag=-o StrictHostKeyChecking=no",
+            "--ssh-flag=-o UserKnownHostsFile=/dev/null",
+            "--ssh-flag=-o ConnectTimeout=10",
+            "--quiet",
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+    def wait_ssh(self, ip: str, timeout: int = 180) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r = self.ssh(ip, "echo SSH_OK", timeout=15)
+            if r.returncode == 0 and "SSH_OK" in r.stdout:
+                return True
+            elapsed = int(time.time() - deadline + timeout)
+            print(f"  Waiting for SSH... ({elapsed}s elapsed)")
+            time.sleep(10)
+        return False
+
+    def create_snapshot(self, vm_id: str, name: str) -> bool:
+        self._run_gcloud([
+            "compute", "instances", "stop", vm_id,
+            f"--project={self.project}", f"--zone={self.zone}", "--quiet",
+        ], timeout=120)
+        r = self._run_gcloud([
+            "compute", "disks", "snapshot", vm_id,
+            f"--project={self.project}", f"--zone={self.zone}",
+            f"--snapshot-names={name}",
+            "--storage-location=europe-west1",
+        ], timeout=120)
+        if r.returncode != 0:
+            print(f"ERROR: Snapshot creation failed: {r.stderr}", file=sys.stderr)
+            return False
+        return True
+
+    def delete_vm(self, vm_id: str) -> None:
+        self._run_gcloud([
+            "compute", "instances", "delete", vm_id,
+            f"--project={self.project}", f"--zone={self.zone}",
+            "--delete-disks=all", "--quiet",
+        ], timeout=120)
+
+    def get_ssh_user(self) -> str:
+        return "root"
 
 
-def _gcloud_ssh(vm_name: str, remote_cmd: str, zone: str, project: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-    wrapped = f"sudo HOME=/root bash -c {shlex.quote(remote_cmd)}"
-    cmd = [
-        "gcloud", "compute", "ssh", vm_name,
-        f"--project={project}", f"--zone={zone}",
-        "--command", wrapped,
-        "--ssh-flag=-o StrictHostKeyChecking=no",
-        "--ssh-flag=-o UserKnownHostsFile=/dev/null",
-        "--ssh-flag=-o ConnectTimeout=10",
-        "--quiet",
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+class SHCProvider(CloudProvider):
+    """SHC (Sovereign Hybrid Compute) VM lifecycle via REST API + SSH."""
 
+    name = "shc"
+    _API_BASE = "https://blesta.sovereignhybridcompute.com/user-api/v2"
+    _PACKAGE_ID = 81
+    _PRICING_ID = 245
 
-def _wait_vm_ssh(vm_name: str, zone: str, project: str, timeout: int = 180) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        r = _gcloud_ssh(vm_name, "echo SSH_OK", zone, project, timeout=15)
-        if r.returncode == 0 and "SSH_OK" in r.stdout:
-            return True
-        elapsed = int(time.time() - deadline + timeout)
-        print(f"  Waiting for SSH... ({elapsed}s elapsed)")
-        time.sleep(10)
-    return False
+    def __init__(self):
+        self.api_key = os.environ.get("SHC_API_KEY", "")
+        if not self.api_key:
+            raise ValueError("SHC_API_KEY not set. Required for --cloud shc.")
+
+    def _ssh_key_path(self) -> str:
+        return os.environ.get("SHC_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519_gitlab"))
+
+    def _ssh_pubkey(self) -> str:
+        pub_path = self._ssh_key_path() + ".pub"
+        with open(pub_path) as f:
+            return f.read().strip()
+
+    def _api(self, method: str, path: str, data: dict | None = None,
+             confirm_id: str | None = None) -> dict:
+        url = f"{self._API_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if confirm_id:
+            headers["X-User-Api-Confirm"] = confirm_id
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode()
+            print(f"SHC API error {e.code}: {err_body[:500]}", file=sys.stderr)
+            raise
+
+    def create_vm(self, name: str, machine_type: str, disk_size_gb: int) -> dict:
+        pubkey = self._ssh_pubkey()
+        order = {
+            "package_id": self._PACKAGE_ID,
+            "pricing_id": self._PRICING_ID,
+            "hostname": name,
+            "ssh_key": pubkey,
+        }
+        resp = self._api("POST", "/ordering/submit", order)
+        if resp.get("confirmation_required"):
+            cnf_id = resp.get("confirmation_id", "")
+            print(f"  Confirming order ({cnf_id})...")
+            resp = self._api("POST", "/ordering/submit", order, confirm_id=cnf_id)
+        vm_id = str(resp.get("service_id") or resp.get("id") or "")
+        if not vm_id:
+            raise RuntimeError(f"SHC order did not return a VM ID: {resp}")
+        print(f"  VM ordered: service_id={vm_id}, waiting for provisioning...")
+        summary = self._wait_provisioning(int(vm_id))
+        ips = summary.get("ips", [])
+        if not ips:
+            raise RuntimeError(f"SHC VM {vm_id} has no IP addresses")
+        ip = ips[0].get("ip", "") if isinstance(ips[0], dict) else str(ips[0])
+        print(f"  VM ready: id={vm_id}, ip={ip}")
+        return {"ip": ip, "id": vm_id}
+
+    def _wait_provisioning(self, vm_id: int, timeout: int = 300) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            summary = self._api("GET", f"/vm/{vm_id}/summary")
+            state = summary.get("provisioning_state", "unknown")
+            print(f"  provisioning_state={state}")
+            if state == "ready":
+                return summary
+            if state in ("failed", "error"):
+                raise RuntimeError(f"SHC VM {vm_id} provisioning failed: {summary}")
+            time.sleep(10)
+        raise RuntimeError(f"SHC VM {vm_id} not ready after {timeout}s")
+
+    def ssh(self, ip: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess[str]:
+        user = self.get_ssh_user()
+        wrapped = f"sudo HOME=/home/{user} bash -c {shlex.quote(command)}"
+        cmd = [
+            "ssh", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+            "-i", self._ssh_key_path(),
+            f"{user}@{ip}", wrapped,
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+
+    def wait_ssh(self, ip: str, timeout: int = 180) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            r = self.ssh(ip, "echo SSH_OK", timeout=15)
+            if r.returncode == 0 and "SSH_OK" in r.stdout:
+                return True
+            elapsed = int(time.time() - deadline + timeout)
+            print(f"  Waiting for SSH... ({elapsed}s elapsed)")
+            time.sleep(5)
+        return False
+
+    def create_snapshot(self, vm_id: str, name: str) -> bool:
+        print("  Snapshot skipped (SHC limit: 1 per VM)")
+        return False
+
+    def delete_vm(self, vm_id: str) -> None:
+        print(f"  VM deletion: use 'shc cancel {vm_id}' or let billing period expire")
+
+    def get_ssh_user(self) -> str:
+        return "debian"
 
 
 def _step(step_num: int, total: int, name: str) -> None:
@@ -107,48 +313,51 @@ def _auto_snapshot_name() -> str:
 
 
 def cmd_bake(args: argparse.Namespace) -> int:
-    zone = cast(str, args.zone)
+    cloud = cast(str, args.cloud)
     machine_type = cast(str, args.machine_type)
     base_snapshot = cast(str, args.base_snapshot)
     snapshot_name = cast(str, args.snapshot_name) or _auto_snapshot_name()
     disk_size_gb = cast(int, args.disk_size)
-    project = get_project()
+
+    if cloud == "gcp":
+        zone = cast(str, args.zone)
+        project = get_project()
+        provider: CloudProvider = GCPProvider(zone, project, base_snapshot)
+    else:
+        zone = ""
+        project = ""
+        provider = SHCProvider()
 
     total_steps = 12
     vm_name = f"tollgate-bake-{int(time.time())}"
 
     print(f"Bake configuration:")
+    print(f"  Cloud:          {cloud}")
     print(f"  Base snapshot:  {base_snapshot}")
     print(f"  New snapshot:   {snapshot_name}")
-    print(f"  Project:        {project}")
-    print(f"  Zone:           {zone}")
+    if cloud == "gcp":
+        print(f"  Project:        {project}")
+        print(f"  Zone:           {zone}")
     print(f"  Machine type:   {machine_type}")
     print(f"  Temp VM name:   {vm_name}")
 
-    # Step 1: Create temp VM from base snapshot
-    _step(1, total_steps, "Creating temporary VM from base snapshot")
+    # Step 1: Create temp VM
+    _step(1, total_steps, "Creating temporary VM")
     t0 = time.monotonic()
-    ensure_firewall_rules(project)
-    r = _run_gcloud([
-        "compute", "instances", "create", vm_name,
-        f"--project={project}", f"--zone={zone}",
-        f"--machine-type={machine_type}",
-        f"--source-snapshot={base_snapshot}",
-        f"--boot-disk-size={disk_size_gb}GB",
-        "--enable-nested-virtualization",
-        "--min-cpu-platform=Intel Cascade Lake",
-        "--tags=tollgate-runner",
-    ], timeout=300)
-    if r.returncode != 0:
-        print(f"ERROR: Failed to create VM: {r.stderr}", file=sys.stderr)
+    try:
+        vm_info = provider.create_vm(vm_name, machine_type, disk_size_gb)
+    except Exception as e:
+        print(f"ERROR: Failed to create VM: {e}", file=sys.stderr)
         return 1
-    print(f"  VM created in {time.monotonic() - t0:.1f}s")
+    ip = vm_info["ip"]
+    vm_id = vm_info["id"]
+    print(f"  VM created in {time.monotonic() - t0:.1f}s (ip={ip})")
 
     try:
         # Step 2: Wait for SSH
         _step(2, total_steps, "Waiting for SSH access")
         t0 = time.monotonic()
-        if not _wait_vm_ssh(vm_name, zone, project):
+        if not provider.wait_ssh(ip):
             print("ERROR: SSH not available after 180s", file=sys.stderr)
             return 1
         print(f"  SSH ready in {time.monotonic() - t0:.1f}s")
@@ -172,7 +381,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             f"fi && "
             "echo IMAGES_OK"
         )
-        r = _gcloud_ssh(vm_name, images_cmd, zone, project, timeout=600)
+        r = provider.ssh(ip, images_cmd, timeout=600)
         if r.returncode != 0 or "IMAGES_OK" not in (r.stdout or ""):
             print(f"ERROR: Image download failed: {r.stderr[:500]}", file=sys.stderr)
             return 1
@@ -200,7 +409,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh google-cloud-cli socat >/dev/null && "
             "command -v gh >/dev/null && command -v gcloud >/dev/null && echo CLI_INSTALLED_OK"
         )
-        r = _gcloud_ssh(vm_name, gh_install_cmd, zone, project, timeout=180)
+        r = provider.ssh(ip, gh_install_cmd, timeout=180)
         if r.returncode != 0 or "CLI_INSTALLED_OK" not in (r.stdout or ""):
             print(f"WARNING: CLI install may have failed: {r.stderr[:300]}", file=sys.stderr)
         print(f"  Done in {time.monotonic() - t0:.1f}s")
@@ -220,7 +429,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "/opt/tollgate-venv/bin/pip install -q -r /opt/tollgate-test/requirements.txt && "
             "/opt/tollgate-venv/bin/python3 -c 'import pytest; print(\"VENV_OK\")'"
         )
-        r = _gcloud_ssh(vm_name, venv_cmd, zone, project, timeout=300)
+        r = provider.ssh(ip, venv_cmd, timeout=300)
         if r.returncode != 0 or "VENV_OK" not in (r.stdout or ""):
             print(f"WARNING: Python venv creation may have failed: {r.stderr[:300]}", file=sys.stderr)
         print(f"  Done in {time.monotonic() - t0:.1f}s")
@@ -239,7 +448,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "$(/opt/cashu-venv/bin/python3 -c 'import cashu.core.models; print(cashu.core.models.__file__)') && "
             "test -x /opt/cashu-venv/bin/cashu && echo CASHU_OK"
         )
-        r = _gcloud_ssh(vm_name, cashu_cmd, zone, project, timeout=300)
+        r = provider.ssh(ip, cashu_cmd, timeout=300)
         if r.returncode != 0 or "CASHU_OK" not in (r.stdout or ""):
             print(f"WARNING: Cashu CLI install may have failed: {r.stderr[:300]}", file=sys.stderr)
         print(f"  Done in {time.monotonic() - t0:.1f}s")
@@ -263,7 +472,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "/opt/cdk-mintd/cdk-cli --version 2>&1 | head -1 && "
             "echo CDK_OK"
         )
-        r = _gcloud_ssh(vm_name, cdk_cmd, zone, project, timeout=180)
+        r = provider.ssh(ip, cdk_cmd, timeout=180)
         if r.returncode != 0 or "CDK_OK" not in (r.stdout or ""):
             print(f"WARNING: CDK install may have failed: {r.stderr[:300]}", file=sys.stderr)
         print(f"  Done in {time.monotonic() - t0:.1f}s")
@@ -291,7 +500,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "qemu-img create -f qcow2 -F qcow2 -b \"$OWRT_BASE\" overlays/tollgate-poc.qcow2 >/dev/null && "
             "echo BRIDGE_OK"
         )
-        r = _gcloud_ssh(vm_name, bridge_cmd, zone, project, timeout=60)
+        r = provider.ssh(ip, bridge_cmd, timeout=60)
         if r.returncode != 0 or "BRIDGE_OK" not in (r.stdout or ""):
             print(f"ERROR: Bridge setup failed: {r.stderr[:300]}", file=sys.stderr)
             return 1
@@ -313,9 +522,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "-pidfile run/openwrt.pid "
             ">/tmp/openwrt-qemu.log 2>&1 &"
         )
-        r = _gcloud_ssh(vm_name, qemu_boot_cmd, zone, project, timeout=30)
-        # nohup returns immediately, but gcloud ssh may block
-        # Wait a moment for QEMU to start
+        r = provider.ssh(ip, qemu_boot_cmd, timeout=30)
         time.sleep(3)
 
         # Now run the serial provisioning script inline
@@ -411,7 +618,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "print('SERIAL_PROVISION_OK')\n"
             "PYEOF\n"
         )
-        r = _gcloud_ssh(vm_name, serial_provision_cmd, zone, project, timeout=180)
+        r = provider.ssh(ip, serial_provision_cmd, timeout=180)
         if r.returncode != 0 or "SERIAL_PROVISION_OK" not in (r.stdout or ""):
             print(f"ERROR: Serial provisioning failed: {r.stderr[:500]}", file=sys.stderr)
             print(f"  stdout: {(r.stdout or '')[:500]}", file=sys.stderr)
@@ -427,7 +634,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "sleep 2; "
             "done"
         )
-        r = _gcloud_ssh(vm_name, ssh_wait_cmd, zone, project, timeout=120)
+        r = provider.ssh(ip, ssh_wait_cmd, timeout=120)
         if r.returncode != 0:
             print(f"WARNING: OpenWrt SSH wait returned {r.returncode}", file=sys.stderr)
         print(f"  Serial provisioning done in {time.monotonic() - t0:.1f}s")
@@ -442,7 +649,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             f"'opkg update >/dev/null 2>&1 && opkg install {wifi_pkgs} 2>&1 && echo WIFI_PKGS_OK || echo WIFI_PKGS_SKIP' "
             "2>/dev/null || true"
         )
-        r = _gcloud_ssh(vm_name, wifi_install_cmd, zone, project, timeout=120)
+        r = provider.ssh(ip, wifi_install_cmd, timeout=120)
         if "WIFI_PKGS_OK" in (r.stdout or ""):
             print("  WiFi packages installed: kmod-mac80211-hwsim wpad-basic iw-full iwinfo")
         else:
@@ -454,7 +661,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             f"-o ConnectTimeout=3 root@{OPENWRT_IP} 'sync; poweroff' 2>/dev/null || true; "
             "sleep 8"
         )
-        _gcloud_ssh(vm_name, shutdown_cmd, zone, project, timeout=30)
+        provider.ssh(ip, shutdown_cmd, timeout=30)
 
         # Step 8c: Build and install vwifi binaries for cross-VM WiFi relay
         _step(10, total_steps, "Building vwifi binaries for cross-VM WiFi relay")
@@ -480,7 +687,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "modprobe vhost_vsock 2>/dev/null || true && "
             "echo VWIFI_BUILD_OK"
         )
-        r = _gcloud_ssh(vm_name, vwifi_build_cmd, zone, project, timeout=600)
+        r = provider.ssh(ip, vwifi_build_cmd, timeout=600)
         if "VWIFI_BUILD_OK" in (r.stdout or ""):
             print("  vwifi binaries built and installed to /opt/vwifi/bin/")
             print("  Done in {:.1f}s".format(time.monotonic() - t0_vwifi))
@@ -493,8 +700,6 @@ def cmd_bake(args: argparse.Namespace) -> int:
         t0_deb = time.monotonic()
         debian_pw_cmd = (
             f"cd {workdir} && "
-            # Reuse existing Debian overlay from base snapshot (already has SSH + password configured)
-            # Only create fresh overlay if the cached one doesn't exist
             "if [ -f overlays/debian-client.qcow2 ]; then "
             "echo 'Reusing cached Debian overlay'; "
             "else "
@@ -522,7 +727,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             f"-device virtio-net-pci,netdev=mgmt0,mac=52:54:00:c0:02:64 "
             ">/tmp/debian-qemu.log 2>&1 &"
         )
-        r = _gcloud_ssh(vm_name, debian_pw_cmd, zone, project, timeout=60)
+        r = provider.ssh(ip, debian_pw_cmd, timeout=60)
 
         print("  Waiting for Debian VM SSH...")
         deb_ssh_wait = (
@@ -532,7 +737,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
             f"-o ConnectTimeout=3 root@10.99.99.100 'echo DEB_SSH_OK' 2>/dev/null && break; "
             "sleep 2; done"
         )
-        r = _gcloud_ssh(vm_name, deb_ssh_wait, zone, project, timeout=120)
+        r = provider.ssh(ip, deb_ssh_wait, timeout=120)
 
         if "DEB_SSH_OK" in (r.stdout or ""):
             print("  Debian VM SSH ready, installing Playwright...")
@@ -549,7 +754,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
                 "python3 -m playwright install chromium >/dev/null && "
                 "python3 -c \"import playwright; print('PLAYWRIGHT_OK')\"' 2>&1"
             )
-            r = _gcloud_ssh(vm_name, pw_install, zone, project, timeout=600)
+            r = provider.ssh(ip, pw_install, timeout=600)
             if "PLAYWRIGHT_OK" in (r.stdout or ""):
                 print("  Playwright + Chromium installed in Debian overlay")
             else:
@@ -571,7 +776,7 @@ def cmd_bake(args: argparse.Namespace) -> int:
                 "rm -f overlays/debian-client.qcow2 && "
                 "echo DEBIAN_FLATTEN_OK"
             )
-            r = _gcloud_ssh(vm_name, deb_shutdown, zone, project, timeout=120)
+            r = provider.ssh(ip, deb_shutdown, timeout=120)
             if "DEBIAN_FLATTEN_OK" in (r.stdout or ""):
                 print(f"  Debian base image updated with Playwright ({time.monotonic() - t0_deb:.1f}s)")
             else:
@@ -579,35 +784,39 @@ def cmd_bake(args: argparse.Namespace) -> int:
         else:
             print(f"  WARNING: Debian VM SSH not ready, skipping Playwright pre-bake ({time.monotonic() - t0_deb:.1f}s)", file=sys.stderr)
 
-        # Step 9: Install GitHub Actions runner binary
-        _step(11, total_steps, "Installing GitHub Actions runner binary")
-        t0_runner = time.monotonic()
-        runner_version = "2.334.0"
-        runner_install_cmd = (
-            "id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner && "
-            f"RUNNER_VERSION={runner_version} && "
-            'RUNNER_DIR=/home/runner/actions-runner && '
-            f'[ -f "$RUNNER_DIR/run.sh" ] && grep -q "{runner_version}" "$RUNNER_DIR/run.sh" && echo "Runner v{runner_version} already present" && echo RUNNER_INSTALL_OK && exit 0; '
-            'echo "Removing old runner..." && rm -rf "$RUNNER_DIR" && '
-            'rm -rf "$RUNNER_DIR" && mkdir -p "$RUNNER_DIR" && '
-            'cd "$RUNNER_DIR" && '
-            "curl -fL -o actions-runner-linux-x64.tar.gz "
-            '"https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-x64-$RUNNER_VERSION.tar.gz" && '
-            "tar xzf actions-runner-linux-x64.tar.gz && "
-            "rm -f actions-runner-linux-x64.tar.gz && "
-            "chown -R runner:runner /home/runner/actions-runner && "
-            'ls "$RUNNER_DIR/run.sh" && '
-            "echo RUNNER_INSTALL_OK"
-        )
-        r = _gcloud_ssh(vm_name, runner_install_cmd, zone, project, timeout=300)
-        if "RUNNER_INSTALL_OK" in (r.stdout or ""):
-            print(f"  GitHub Actions runner v{runner_version} installed to /home/runner/actions-runner/")
-            print("  Done in {:.1f}s".format(time.monotonic() - t0_runner))
+        # Step 11: Install GitHub Actions runner binary (GCP only)
+        if cloud == "gcp":
+            _step(11, total_steps, "Installing GitHub Actions runner binary")
+            t0_runner = time.monotonic()
+            runner_version = "2.334.0"
+            runner_install_cmd = (
+                "id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner && "
+                f"RUNNER_VERSION={runner_version} && "
+                'RUNNER_DIR=/home/runner/actions-runner && '
+                f'[ -f "$RUNNER_DIR/run.sh" ] && grep -q "{runner_version}" "$RUNNER_DIR/run.sh" && echo "Runner v{runner_version} already present" && echo RUNNER_INSTALL_OK && exit 0; '
+                'echo "Removing old runner..." && rm -rf "$RUNNER_DIR" && '
+                'rm -rf "$RUNNER_DIR" && mkdir -p "$RUNNER_DIR" && '
+                'cd "$RUNNER_DIR" && '
+                "curl -fL -o actions-runner-linux-x64.tar.gz "
+                '"https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/actions-runner-linux-x64-$RUNNER_VERSION.tar.gz" && '
+                "tar xzf actions-runner-linux-x64.tar.gz && "
+                "rm -f actions-runner-linux-x64.tar.gz && "
+                "chown -R runner:runner /home/runner/actions-runner && "
+                'ls "$RUNNER_DIR/run.sh" && '
+                "echo RUNNER_INSTALL_OK"
+            )
+            r = provider.ssh(ip, runner_install_cmd, timeout=300)
+            if "RUNNER_INSTALL_OK" in (r.stdout or ""):
+                print(f"  GitHub Actions runner v{runner_version} installed to /home/runner/actions-runner/")
+                print("  Done in {:.1f}s".format(time.monotonic() - t0_runner))
+            else:
+                print(f"  WARNING: Runner install failed (non-fatal): {(r.stdout or '')[:200]}", file=sys.stderr)
+                print(f"  stderr: {(r.stderr or '')[:300]}", file=sys.stderr)
         else:
-            print(f"  WARNING: Runner install failed (non-fatal): {(r.stdout or '')[:200]}", file=sys.stderr)
-            print(f"  stderr: {(r.stderr or '')[:300]}", file=sys.stderr)
+            _step(11, total_steps, "Installing GitHub Actions runner binary")
+            print("  Skipped (GCP-specific)")
 
-        # Step 10: Stop QEMU and copy overlay as new base
+        # Step 12: Stop QEMU and copy overlay as new base
         _step(12, total_steps, "Stopping QEMU and replacing base image with provisioned overlay")
         t0 = time.monotonic()
         replace_cmd = (
@@ -623,48 +832,31 @@ def cmd_bake(args: argparse.Namespace) -> int:
             "rm -f overlays/tollgate-poc.qcow2 overlays/tollgate-seller.qcow2 && "
             "echo BASE_REPLACED_OK"
         )
-        r = _gcloud_ssh(vm_name, replace_cmd, zone, project, timeout=120)
+        r = provider.ssh(ip, replace_cmd, timeout=120)
         if r.returncode != 0 or "BASE_REPLACED_OK" not in (r.stdout or ""):
             print(f"ERROR: Base image replacement failed: {r.stderr[:300]}", file=sys.stderr)
             return 1
         print(f"  Base image replaced in {time.monotonic() - t0:.1f}s")
 
-        # Step 11: Stop VM and create snapshot
-        _step(12, total_steps, "Stopping VM and creating snapshot")
+        # Snapshot
+        _step(12, total_steps, "Creating snapshot")
         t0 = time.monotonic()
-        r = _run_gcloud([
-            "compute", "instances", "stop", vm_name,
-            f"--project={project}", f"--zone={zone}", "--quiet",
-        ], timeout=120)
-        if r.returncode != 0:
-            print(f"WARNING: VM stop failed: {r.stderr[:300]}", file=sys.stderr)
-
-        disk_name = vm_name
-        r = _run_gcloud([
-            "compute", "disks", "snapshot", disk_name,
-            f"--project={project}", f"--zone={zone}",
-            f"--snapshot-names={snapshot_name}",
-            "--storage-location=europe-west1",
-        ], timeout=120)
-        if r.returncode != 0:
-            print(f"ERROR: Snapshot creation failed: {r.stderr}", file=sys.stderr)
-            return 1
-        print(f"  Snapshot created in {time.monotonic() - t0:.1f}s")
+        provider.create_snapshot(vm_id, snapshot_name)
+        print(f"  Snapshot step done in {time.monotonic() - t0:.1f}s")
 
     finally:
-        # Clean up temp VM
         print("\nCleaning up temporary VM...")
-        _run_gcloud([
-            "compute", "instances", "delete", vm_name,
-            f"--project={project}", f"--zone={zone}",
-            "--delete-disks=all", "--quiet",
-        ], timeout=120)
+        provider.delete_vm(vm_id)
 
     print(f"\n{'=' * 60}")
     print(f"Bake complete!")
-    print(f"  New snapshot: {snapshot_name}")
-    print(f"  To use: update SNAPSHOT_NAME in lib/cloud_lab/constants.py")
-    print(f"  Verify: ./scripts/cloud-lab.py up --vm-name test-bake-vm")
+    print(f"  Cloud:          {cloud}")
+    print(f"  New snapshot:   {snapshot_name}")
+    if cloud == "gcp":
+        print(f"  To use: update SNAPSHOT_NAME in lib/cloud_lab/constants.py")
+        print(f"  Verify: ./scripts/cloud-lab.py up --vm-name test-bake-vm")
+    else:
+        print(f"  VM {vm_id} is ready for use (no snapshot on SHC)")
     return 0
 
 
@@ -673,6 +865,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     bake = sub.add_parser("bake", help="Bake a new snapshot from the current base snapshot")
+    bake.add_argument("--cloud", default="gcp", choices=["gcp", "shc"], help="Cloud provider")
     bake.add_argument("--snapshot-name", default="", help=f"Name for the new snapshot (default: auto-increment from {SNAPSHOT_NAME})")
     bake.add_argument("--base-snapshot", default=SNAPSHOT_NAME, help=f"Base snapshot to create VM from (default: {SNAPSHOT_NAME})")
     bake.add_argument("--zone", default=DEFAULT_ZONE)
