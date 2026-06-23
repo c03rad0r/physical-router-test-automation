@@ -31,12 +31,7 @@ _CONCURRENCY = [1, 5, 10, 20]
 
 
 def _measure_latency_ssh(ip: str, path: str, iterations: int = _LATENCY_ITERATIONS) -> dict[str, float]:
-    """Measure HTTP latency to the OpenWrt backend via SSH.
-
-    Runs curl inside the OpenWrt VM to avoid SSH round-trip overhead.
-    Returns dict with min, p50, p95, p99, mean (all in ms).
-    """
-    script = shlex.quote(
+    script = (
         f"for i in $(seq 1 {iterations}); do "
         f"curl -s -o /dev/null -w '%{{time_total}}\\n' "
         f"http://127.0.0.1:2121{path} 2>/dev/null; "
@@ -66,16 +61,10 @@ def _measure_latency_ssh(ip: str, path: str, iterations: int = _LATENCY_ITERATIO
 
 
 def _measure_concurrent_throughput(ip: str, path: str, concurrency: int, duration_s: int = 5) -> dict[str, Any]:
-    """Measure concurrent request throughput from the Debian VM.
-
-    Uses curl in a bash loop with background processes to simulate
-    concurrent clients. Returns requests/sec and latency stats.
-    """
-    # Run on the Debian VM (more CPU available than OpenWrt)
     from lib.cloud_lab.constants import DEBIAN_IP
     from lib.cloud_lab.worker.inner_ssh import inner_ssh as _ssh
 
-    script = shlex.quote(
+    script = (
         f"END_TIME=$(($(date +%s) + {duration_s})); "
         f"COUNTER=/tmp/tg-bench-counter-$$; "
         f"echo 0 > $COUNTER; "
@@ -105,8 +94,7 @@ def _measure_concurrent_throughput(ip: str, path: str, concurrency: int, duratio
 
 
 def _collect_system_metrics(ip: str) -> dict[str, Any]:
-    """Collect system metrics from the OpenWrt VM."""
-    script = shlex.quote(
+    script = (
         "echo 'loadavg:' $(cut -d' ' -f1-3 /proc/loadavg); "
         "echo 'meminfo:' $(grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo | tr '\\n' ' '); "
         "echo 'uptime:' $(cut -d' ' -f1 /proc/uptime); "
