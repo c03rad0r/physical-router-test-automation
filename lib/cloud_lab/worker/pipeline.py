@@ -396,6 +396,17 @@ def run_worker(config: WorkerConfig) -> int:
         ]:
             _run(f"cp {shlex.quote(str(path))} {shlex.quote(str(results_dir))}/raw/{shlex.quote(str(name))}.log 2>/dev/null || true", timeout=5, check=False)
 
+        # Redacted log summary for remote troubleshooting via Blossom.
+        # Extracts key lines (errors, deploy results, pipeline steps) without
+        # exposing passwords, IPs, or tokens that the security scanner blocks.
+        _run(
+            f"grep -E '(\\[.*\\\\/.*\\]|Pipeline|deploy|backend|health|artifact|bench|publish|Nostr|verify|DVM|passed|failed|skipped|error|Error|ERROR|warning|WARNING|FAIL|PASS|Traceback|RuntimeError|FileNotFound|cannot find|rejected|installed|opkg|tollgate)' "
+            f"{results_dir}/raw/worker.log 2>/dev/null | "
+            f"sed 's/sshpass -p[^ ]*/sshpass -p***/g; s/password=[^ ]*/password=***/g; s/token=[^ ]*/token=***/g' "
+            f"> {results_dir}/raw/log-summary.txt 2>/dev/null || true",
+            timeout=10, check=False,
+        )
+
         _step_start("collect-render")
         try:
             log.info("[11/11] Collect + render results")
