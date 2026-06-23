@@ -283,7 +283,7 @@ def ensure_debian_client_deps() -> bool:
         "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true install -y -qq --no-install-recommends "
         "python3-pip libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 "
         "libdrm2 libgbm1 libglib2.0-0 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 "
-        "libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xvfb fonts-liberation fonts-freefont-ttf >/dev/null && "
+        "libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 xvfb ffmpeg fonts-liberation fonts-freefont-ttf >/dev/null && "
         "python3 -m pip install -q --break-system-packages playwright && "
         "python3 -m playwright install chromium >/dev/null && "
         'python3 -c "import playwright; print(\\"PLAYWRIGHT_OK\\")"'
