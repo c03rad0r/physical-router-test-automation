@@ -240,6 +240,9 @@ def run_worker(config: WorkerConfig) -> int:
             else:
                 log.info("[vwifi] Skipped (not enabled — use --vwifi to opt in)")
 
+            write_env_file(config)
+            log.info("[pre-inner] .env written to %s/.env", TEST_DIR)
+
             _step_start("inner-vms")
             log.info("[4/10] Inner VMs (OpenWrt + Debian)")
             start_inner_vms(config)
@@ -285,8 +288,7 @@ def run_worker(config: WorkerConfig) -> int:
             _step_end("local-mints")
 
             _step_start("env-debian-deps")
-            log.info("[6/10] Write .env + Debian client deps")
-            write_env_file(config)
+            log.info("[6/10] Debian client deps")
             ensure_debian_client_deps()
             _step_end("env-debian-deps")
 
