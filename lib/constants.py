@@ -4,6 +4,13 @@ BACKEND_PORT = 2121
 CGI_PORT = 8080
 PING_HOST = "1.1.1.1"
 
+NOSTR_RELAYS = [
+    r.strip() for r in os.environ.get("NOSTR_RELAYS", "wss://relay.cashu.email").split(",") if r.strip()
+]
+BLOSSOM_SERVERS = [
+    s.strip() for s in os.environ.get("BLOSSOM_SERVERS", "https://blossom.psbt.me").split(",") if s.strip()
+]
+
 TEST_MINT_URL = os.environ.get("TOLLGATE_TEST_MINT_URL", "https://testnut.cashu.exchange")
 
 # Go backend (gonuts) only supports Keyset ID V1 (00-prefix, 8-byte).
