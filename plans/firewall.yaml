@@ -1,0 +1,13 @@
+name: firewall
+description: RFC 1918 isolation — public WiFi blocked from upstream private networks
+deploy: false
+reset: false
+exclusive_router: false
+runners:
+  - name: api
+    command: ./scripts/run-api.sh --no-render
+    framework: pytest
+    markers: [firewall]
+    timeout: 60
+required_capabilities:
+  - router
