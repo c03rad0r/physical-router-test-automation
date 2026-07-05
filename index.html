@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <script>if(location.protocol==='http:'&&location.hostname.includes('tollgate.me'))location.replace('https://'+location.host+location.pathname+location.hash)</script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Amperstrand Test Dashboard — Live Results</title>
+  <meta name="description" content="Unified test results for all Amperstrand projects. Fetched live from Nostr relays, artifacts from Blossom.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23f60'/><text x='50' y='68' font-size='52' font-weight='bold' text-anchor='middle' fill='white' font-family='sans-serif'>TG</text></svg>">
+  <link rel="stylesheet" href="style.css?v=12">
+</head>
+<body>
+  <div id="app">
+
+    <div id="error-banner" class="error-banner" hidden>
+      <span class="error-banner-icon">&#9888;</span>
+      <span class="error-banner-text"></span>
+      <button class="error-banner-copy" type="button">Copy</button>
+      <button class="error-banner-dismiss" type="button" aria-label="Dismiss">&times;</button>
+    </div>
+
+    <header>
+      <div class="header-left">
+        <button id="menu-toggle" aria-label="Toggle runs list">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="3" y1="6" x2="21" y2="6"/>
+            <line x1="3" y1="12" x2="21" y2="12"/>
+            <line x1="3" y1="18" x2="21" y2="18"/>
+          </svg>
+        </button>
+        <div class="header-brand">
+          <span class="logo-mark">TG</span>
+          <h1>Amperstrand Tests</h1>
+        </div>
+        <span class="subtitle">All Projects &mdash; Live Results</span>
+      </div>
+      <div class="header-right">
+        <span id="live-indicator" class="live-indicator idle" title="Connecting…">
+          <span class="live-dot"></span>
+          <span class="live-text">Live</span>
+        </span>
+        <span id="conn-status" class="conn-badge offline">Offline</span>
+        <a href="https://github.com/OpenTollGate/physical-router-test-automation" target="_blank" class="link" rel="noopener">GitHub</a>
+        <span class="npub" title="Bot npub hex">npub1prta…</span>
+      </div>
+    </header>
+
+    <nav class="view-toggle" id="view-toggle" aria-label="Dashboard views">
+      <button class="view-toggle-btn active" data-view="runs" type="button">Test Runs</button>
+      <button class="view-toggle-btn" data-view="jobs" type="button">CVM Jobs</button>
+      <button class="view-toggle-btn" data-view="services" type="button">CVM Services</button>
+    </nav>
+
+    <main>
+      <!-- Mobile backdrop -->
+      <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+      <aside id="runs-list">
+        <div class="loading" id="runs-loading">
+          <div class="connecting">
+            <div class="spinner"></div>
+            <p>Connecting to relays…</p>
+          </div>
+        </div>
+      </aside>
+
+      <section id="run-view">
+        <div class="empty-state">
+          <div class="empty-icon empty-icon-arrow">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+              <line x1="8" y1="21" x2="16" y2="21"/>
+              <line x1="12" y1="17" x2="12" y2="21"/>
+            </svg>
+          </div>
+          <p class="empty-title">Select a test run</p>
+          <p class="empty-hint empty-hint-desktop">&larr; Select a run from the list</p>
+          <p class="empty-hint empty-hint-mobile">Tap a run to view details</p>
+          <p class="hint">Runs are fetched live from Nostr relays.<br>
+          Screenshots load on demand to be gentle on <a href="https://blossom.psbt.me" target="_blank" rel="noopener">blossom.psbt.me</a></p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Powered by
+        <a href="https://github.com/nostr-protocol/nips/blob/master/94.md" target="_blank" rel="noopener">NIP-94</a> +
+        <a href="https://github.com/hzrd149/blossom" target="_blank" rel="noopener">Blossom</a> +
+        <a href="https://github.com/nostr-protocol/nips/blob/master/90.md" target="_blank" rel="noopener">NIP-90 DVM</a> +
+        <a href="https://github.com/nostr-protocol/nips/blob/master/78.md" target="_blank" rel="noopener">kind 30078</a> run summaries
+      </span>
+    </footer>
+  </div>
+
+  <!-- Lightbox for full-size screenshots -->
+  <div id="lightbox" class="lightbox" hidden>
+    <div class="lightbox-backdrop"></div>
+    <img class="lightbox-img" alt="Screenshot full size">
+    <button class="lightbox-close" aria-label="Close">&times;</button>
+    <a class="lightbox-open" target="_blank" rel="noopener" title="Open original">Open original &#8599;</a>
+  </div>
+
+  <!-- HTML viewer modal (inline iframe) -->
+  <div id="html-viewer" class="html-viewer-modal" hidden>
+    <div class="html-viewer-backdrop"></div>
+    <div class="html-viewer-content">
+      <div class="html-viewer-header">
+        <span class="html-viewer-title"></span>
+        <div class="html-viewer-actions">
+          <a class="html-viewer-open" target="_blank" rel="noopener">Open original &#8599;</a>
+          <button class="html-viewer-close" aria-label="Close">&times;</button>
+        </div>
+      </div>
+      <iframe sandbox="allow-same-origin" class="html-viewer-frame"></iframe>
+    </div>
+  </div>
+
+  <script defer src="app.js?v=12"></script>
+</body>
+</html>
